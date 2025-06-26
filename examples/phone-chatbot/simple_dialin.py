@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import os
 import sys
+import time
 
 from call_connection_manager import CallConfigManager, SessionManager
 from dotenv import load_dotenv
@@ -15,7 +16,7 @@ from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndTaskFrame
+from pipecat.frames.frames import EndTaskFrame, EndFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -25,6 +26,7 @@ from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.services.daily import DailyDialinSettings, DailyParams, DailyTransport
+from pipecat.processors.user_idle_processor import UserIdleProcessor
 
 load_dotenv(override=True)
 
@@ -33,6 +35,13 @@ logger.add(sys.stderr, level="DEBUG")
 
 daily_api_key = os.getenv("DAILY_API_KEY", "")
 daily_api_url = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
+
+class CallStats:
+    def __init__(self):
+        self.start_time = time.time()
+        self.silence_events = 0
+        self.silence_start = None
+        self.total_silence_duration = 0.0
 
 
 async def main(
@@ -108,6 +117,49 @@ async def main(
         # Then end the call
         await params.llm.queue_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
 
+    async def handle_user_idle(processor, retry_count):
+        # Start tracking silence when first detected
+        if processor.stats.silence_start is None:
+            processor.stats.silence_start = time.time()
+
+        processor.stats.silence_events += 1
+
+        if retry_count == 1:
+            await processor.push_frame(TTSSpeakFrame("It seems quiet on your end. Would you like to continue our chat?"))
+            return True
+        elif retry_count == 2:
+            await processor.push_frame(TTSSpeakFrame("Just checking in, are you still there?"))
+            return True
+        elif retry_count == 3:
+            await processor.push_frame(TTSSpeakFrame("I haven't heard from you in a while. Do you want to keep talking?"))
+            return True
+        else:
+            # Calculate final silence duration
+            if processor.stats.silence_start:
+                silence_duration = time.time() - processor.stats.silence_start
+                processor.stats.total_silence_duration += silence_duration
+
+            # Log final stats before ending
+            duration = time.time() - processor.stats.start_time
+            logger.info(f"""
+            Call Summary:
+            - Duration: {duration:.1f} seconds
+            - Silence Events: {processor.stats.silence_events}
+            - Total Silence Duration: {processor.stats.total_silence_duration:.1f} seconds
+            """)
+            
+            await processor.push_frame(TTSSpeakFrame("I'll leave you for now. Have a nice day!"))
+            await terminate_call(FunctionCallParams(
+                function_name="terminate_call",
+                tool_call_id="user_idle_termination",  # this is fine as is
+                arguments={},
+                context={},
+                result_callback=lambda x: None,
+                llm=processor
+            ))
+
+            return False
+
     # Define function schemas for tools
     terminate_call_function = FunctionSchema(
         name="terminate_call",
@@ -137,6 +189,12 @@ async def main(
     context = OpenAILLMContext(messages, tools)
     context_aggregator = llm.create_context_aggregator(context)
 
+    user_idle = UserIdleProcessor(
+        callback=handle_user_idle,
+        timeout=5.0  # 10 seconds
+    )
+    user_idle.stats = CallStats()
+
     # ------------ PIPELINE SETUP ------------
 
     # Build pipeline
@@ -144,6 +202,7 @@ async def main(
         [
             transport.input(),  # Transport user input
             context_aggregator.user(),  # User responses
+            user_idle,
             llm,  # LLM
             tts,  # TTS
             transport.output(),  # Transport bot output
